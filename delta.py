@@ -23,6 +23,10 @@ import requests
 MIN_RATIO = float(os.environ.get("MIN_RATIO", "30"))           # 델타 ÷ 그날 거래량 ≥ 이 % (매수 쏠림)
 MIN_MULT = float(os.environ.get("MIN_MULT", "2"))              # 델타 ≥ 최근 20일 평균 델타 크기 × 이 배수 (이례적 크기)
 BASE_DAYS = int(os.environ.get("BASE_DAYS", "20"))             # 평균 델타 크기 비교 기간(거래일)
+# 누적 판정 (최근 N일 합계). 기간: (쏠림% 최소, 양봉 델타 최소 일수, 큰 양봉 최소 횟수)
+WINDOWS = {5: (20, 4, 1), 10: (15, 6, 2)}
+# 쏠림% = N일 델타 합계 ÷ N일 거래량 합계 · 큰 양봉 = 그날 델타 ≥ 평소 평균 델타 크기 × MIN_MULT
+# 평소 = 누적 구간 바로 전 BASE_DAYS일 (최근 큰 막대가 평균을 부풀리지 않도록 구간과 겹치지 않게)
 MIN_PRICE = float(os.environ.get("MIN_PRICE", "5"))
 MIN_DOLLAR_VOL = float(os.environ.get("MIN_DOLLAR_VOL", "10000000"))       # 종목: 20일 평균 거래대금($)
 MIN_DOLLAR_VOL_ETF = float(os.environ.get("MIN_DOLLAR_VOL_ETF", "5000000"))  # ETF: 20일 평균 거래대금($)
@@ -166,6 +170,33 @@ def analyze(t: str, m5: pd.DataFrame, day: pd.DataFrame, kind: str) -> tuple[dic
         "ratio3": float(last3.sum() / d["vol"].iloc[-3:].sum() * 100), "above50": price > ma50, "price": price,
         "partial": int(today["bars"]) < 70,                               # 5분봉 일부 누락(조기 폐장 등)
     }
+    # 누적 (5일·10일)
+    r["win"] = {}
+    for N, (min_ratio, min_up, min_big) in WINDOWS.items():
+        if len(d) < N + 5:
+            continue
+        w = d.iloc[-N:]
+        b = d.iloc[-(N + BASE_DAYS):-N]
+        b_abs = float(b["delta"].abs().mean())
+        if b_abs <= 0 or w["vol"].sum() <= 0:
+            continue
+        wr = float(w["delta"].sum() / w["vol"].sum() * 100)
+        up = int((w["delta"] > 0).sum())
+        big = int((w["delta"] >= b_abs * MIN_MULT).sum())
+        x = {"delta_usd": float(w["delta"].sum()) * price, "ratio": wr, "up": up, "big": big,
+             "mult": float(w["delta"].sum() / b_abs), "rvol": float(w["vol"].mean() / b["vol"].mean()),
+             "chg": float((c.iloc[-1] / c.iloc[-1 - N] - 1) * 100) if len(c) > N else float("nan")}
+        if x["delta_usd"] <= 0:
+            x["why"] = f"{N}일 누적 델타 마이너스 ({wr:+.0f}%)"
+        elif wr < min_ratio:
+            x["why"] = f"{N}일 쏠림 부족 ({wr:+.0f}% < {min_ratio}%)"
+        elif up < min_up:
+            x["why"] = f"{N}일 중 양봉 델타 {up}일 < {min_up}일"
+        elif big < min_big:
+            x["why"] = f"{N}일 중 큰 양봉 {big}회 < {min_big}회"
+        else:
+            x["why"] = ""
+        r["win"][N] = x
     if r["delta"] <= 0:
         return r, f"델타 마이너스 (매도 우위 {ratio:+.0f}%)"
     if ratio < MIN_RATIO:
@@ -227,6 +258,26 @@ def send_table(title: str, rows: list[dict]):
         first, part = False, part + 1
 
 
+def send_win_table(title: str, rows: list[dict], N: int):
+    head = (fit("TICKER", 7) + fit("누적델타$", 9, True) + fit("쏠림%", 7, True) + fit("양봉", 6, True)
+            + fit("큰양봉", 7, True) + fit("RVOL", 6, True) + fit(f"{N}일%", 7, True) + fit("50일", 5, True) + "  이름")
+    lines = []
+    for r in rows:
+        x = r["win"][N]
+        lines.append(fit(r["t"], 7) + f"{money(x['delta_usd']):>9}{x['ratio']:>+7.0f}" + fit(f"{x['up']}/{N}", 6, True)
+                     + f"{x['big']:>7}{x['rvol']:>6.1f}{x['chg']:>+7.1f}" + fit('위' if r['above50'] else '아래', 5, True)
+                     + "  " + r["name"][:18])
+    first, part = True, 1
+    while lines:
+        block, size = [], 0
+        while lines and size + len(lines[0]) + 1 < 1700:
+            size += len(lines[0]) + 1
+            block.append(lines.pop(0))
+        header = f"**{title}**\n" if first else f"**{title} ({part})**\n"
+        post(f"{header}```\n{head}\n" + "\n".join(block) + "\n```")
+        first, part = False, part + 1
+
+
 # ───────────── 실행 ─────────────
 def main():
     now = dt.datetime.now(NY)
@@ -261,9 +312,12 @@ def main():
             if r is None:
                 lines.append(f"**{t}** ❌ {why.get(t, '알 수 없음')}")
                 continue
-            mark = "✅ 큰 양봉 델타" if r["hit"] else f"❌ {why[t]}"
+            mark = "✅ 하루 큰 양봉 델타" if r["hit"] else f"❌ 하루: {why[t]}"
             lines.append(f"**{t}** {mark}\n　{r['date']} 델타 {money(r['delta_usd'])} ({r['delta']/1e3:+,.0f}K주) · 쏠림 {r['ratio']:+.0f}% · "
                          f"평균의 {r['mult']:.1f}배 · RVOL {r['rvol']:.1f} · 등락 {r['chg']:+.1f}% · 최근 3일 {r['streak']}")
+            for N, x in r.get("win", {}).items():
+                lines.append(f"　{N}일 {'✅' if not x['why'] else '❌ ' + x['why']} · 누적 {money(x['delta_usd'])} · 쏠림 {x['ratio']:+.0f}% · "
+                             f"양봉 {x['up']}/{N}일 · 큰 양봉 {x['big']}회 · RVOL {x['rvol']:.1f} · {N}일 등락 {x['chg']:+.1f}%")
         post("**거래량 델타 진단**\n" + "\n".join(lines))
         return
 
@@ -271,22 +325,35 @@ def main():
         post("⚠️ 거래량 델타: 시세를 받지 못했습니다. 일시적 오류일 수 있습니다.")
         return
     session = max(r["date"] for r in results)
-    hits = sorted([r for r in results if r["hit"] and r["date"] == session], key=lambda r: -r["mult"])
-    stocks = [r for r in hits if r["kind"] == "stock"]
-    etfs = [r for r in hits if r["kind"] == "etf"]
-    post(f"**🟩 거래량 델타 · 큰 양봉 | {session} 마감**\n"
-         f"델타가 거래량의 {MIN_RATIO:g}% 이상 + 최근 {BASE_DAYS}일 평균 크기의 {MIN_MULT:g}배 이상 · "
-         f"종목 {len(stocks)} · ETF {len(etfs)} (확인 {len(results)}개)")
-    for title, rows in (("📈 종목", stocks), ("🧺 ETF", etfs)):
+    cur = [r for r in results if r["date"] == session]
+    day_hits = sorted([r for r in cur if r["hit"]], key=lambda r: -r["mult"])
+    win_hits = {N: sorted([r for r in cur if N in r.get("win", {}) and not r["win"][N]["why"]],
+                          key=lambda r, N=N: -r["win"][N]["mult"]) for N in WINDOWS}
+
+    def cnt(rows, kind):
+        return sum(r["kind"] == kind for r in rows)
+    summary = " / ".join([f"하루 {cnt(day_hits, 'stock')}·{cnt(day_hits, 'etf')}"]
+                         + [f"{N}일 {cnt(v, 'stock')}·{cnt(v, 'etf')}" for N, v in win_hits.items()])
+    post(f"**🟩 거래량 델타 · 매수 우위 | {session} 마감**\n"
+         f"종목·ETF 수: {summary} (확인 {len(results)}개)")
+
+    def cap(title, rows):
+        return (title + f" · 상위 {MAX_ROWS}개 (전체 {len(rows)})", rows[:MAX_ROWS]) if len(rows) > MAX_ROWS else (title, rows)
+    for kind, label in (("stock", "📈 종목"), ("etf", "🧺 ETF")):
+        rows = [r for r in day_hits if r["kind"] == kind]
         if rows:
-            more = f" · 상위 {MAX_ROWS}개만 (전체 {len(rows)})" if len(rows) > MAX_ROWS else ""
-            send_table(title + more, rows[:MAX_ROWS])
-    if hits:
-        post("델타$ = (오른 5분봉 거래량 − 내린 5분봉 거래량) × 종가 · 쏠림% = 델타 ÷ 그날 거래량 · "
-             "평균x = 델타 ÷ 최근 20일 평균 델타 크기 · 3일 = 최근 3일 델타 부호 · 50일 = 50일선 위/아래")
+            send_table(*cap(f"{label} · 하루 큰 양봉 (쏠림 {MIN_RATIO:g}%↑ + 평균의 {MIN_MULT:g}배↑)", rows))
+        for N, (mr, mu, mb) in WINDOWS.items():
+            rows = [r for r in win_hits[N] if r["kind"] == kind]
+            if rows:
+                send_win_table(*cap(f"{label} · {N}일 누적 매수 우위 (쏠림 {mr}%↑ · 양봉 {mu}일↑ · 큰 양봉 {mb}회↑)", rows), N)
+    if day_hits or any(win_hits.values()):
+        post("델타$ = (오른 5분봉 거래량 − 내린 5분봉 거래량) × 종가 · 쏠림% = 델타 ÷ 거래량 · 평균x = 델타 ÷ 평소 평균 델타 크기\n"
+             "양봉 = 델타 플러스인 날 수 · 큰양봉 = 평소의 2배 넘는 양봉 델타 횟수 · RVOL = 기간 평균 거래량 ÷ 평소 · "
+             "누적 표는 누적델타 ÷ 평소 크기가 큰 순")
     if len(results) < len(tickers) * 0.5:
         post(f"⚠️ 거래량 델타: 시세를 {len(results)}/{len(tickers)}종목만 받았습니다. 일시적 오류일 수 있습니다.")
-    print(f"완료: 확인 {len(results)}개, 알림 {len(hits)}개")
+    print(f"완료: 확인 {len(results)}개, 하루 {len(day_hits)}개, 누적 " + ", ".join(f"{N}일 {len(v)}개" for N, v in win_hits.items()))
 
 
 if __name__ == "__main__":
