@@ -1,0 +1,43 @@
+name: Volume Delta Scanner
+
+on:
+  schedule:
+    # 하루 1회, 미국 장 마감 후 (UTC 22:30 = 한국 07:30, 화~토 아침에 전날 미국장 기준)
+    - cron: "30 22 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "테스트 실행 (주말에도 최근 거래일 기준으로 실행)"
+        type: boolean
+        default: true
+      diagnose:
+        description: "진단할 티커 (예: NVDA, XLE). 비워두면 전체 스캔"
+        type: string
+        default: ""
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # S&P 500 목록을 다음 실행으로 넘김 (1주일마다 갱신)
+      - uses: actions/cache@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      - run: python delta.py
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          FORCE: ${{ inputs.force && '1' || '0' }}
+          DIAGNOSE: ${{ inputs.diagnose }}
